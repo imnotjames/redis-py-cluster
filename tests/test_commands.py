@@ -306,6 +306,12 @@ class TestRedisCommands(object):
         assert set(r.keys(pattern='test_*')) == {b(k) for k in keys_with_underscores}
         assert set(r.keys(pattern='test*')) == {b(k) for k in keys}
 
+    def test_mget_same_hash(self, r):
+        r.set('a{foo}', '1')
+        r.set('b{foo}', '2')
+        r.set('c{foo}', '3')
+        assert r.mget('a{foo}', 'other{foo}', 'b{foo}', 'c{foo}') == [b('1'), None, b('2'), b('3')]
+
     def test_mget(self, r):
         assert r.mget(['a', 'b']) == [None, None]
         r['a'] = '1'

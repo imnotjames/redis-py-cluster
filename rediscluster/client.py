@@ -5,6 +5,7 @@ import datetime
 import random
 import string
 import time
+from collections import defaultdict, OrderedDict
 
 # rediscluster imports
 from .connection import (
@@ -677,12 +678,38 @@ class StrictRedisCluster(StrictRedis):
         Returns a list of values ordered identically to ``keys``
 
         Cluster impl:
-            Itterate all keys and send GET for each key.
-            This will go alot slower than a normal mget call in StrictRedis.
+            Attempt to group keys up to send mget commands for each slot.
+            This will be slower than a normal mget call in StrictRedis.
 
-            Operation is no longer atomic.
+            Operation is no longer atomic between slots.
         """
-        return [self.get(arg) for arg in list_or_args(keys, args)]
+        keys = list_or_args(keys, args)
+
+        results = OrderedDict()
+        keys_per_slot = defaultdict(list)
+        # Group by slot because we can't MGET across slots in redis
+
+        if self.refresh_table_asap:
+            self.connection_pool.nodes.initialize()
+            self.refresh_table_asap = False
+
+        for key in keys:
+            # Initialize the results dictionary in the order that the keys were
+            # passed in so we can pretty easily return them back in the same order
+            results[key] = None
+
+            # Find the slot of the key for collecting them together
+            slot = self._determine_slot('MGET', key)
+            keys_per_slot[slot].append(key)
+
+        # For every slot we have keys in, we want to run mget against them
+        for slot, node_args in iteritems(keys_per_slot):
+            node_results = self.execute_command('MGET', *node_args)
+
+            for k, v in zip(node_args, node_results):
+                results[k] = v
+
+        return list(results.values())
 
     def mset(self, *args, **kwargs):
         """
@@ -690,17 +717,36 @@ class StrictRedisCluster(StrictRedis):
         dictionary argument or as kwargs.
 
         Cluster impl:
-            Itterate over all items and do SET on each (k,v) pair
+            Attempt to group keys up to send mget commands for each slot.
+            This will be slower than a normal mset call in StrictRedis.
 
-            Operation is no longer atomic.
+            Operation is no longer atomic between slots.
         """
+        mapping = {}
+
+        mapping.update(kwargs)
+
         if args:
             if len(args) != 1 or not isinstance(args[0], dict):
                 raise RedisError('MSET requires **kwargs or a single dict arg')
-            kwargs.update(args[0])
+            mapping.update(args[0])
 
-        for pair in iteritems(kwargs):
-            self.set(pair[0], pair[1])
+        keys_per_slot = defaultdict(list)
+
+        if self.refresh_table_asap:
+            self.connection_pool.nodes.initialize()
+            self.refresh_table_asap = False
+
+        for key, value in iteritems(mapping):
+            # Find the slot of the key and then the node of the key
+            slot = self._determine_slot('MSET', key)
+
+            # Otherwise, add this key to the list of keys for a specific node
+            keys_per_slot[slot].extend((key, value))
+
+        # For every node we have keys in, we want to run mget against them
+        for slot, node_args in iteritems(keys_per_slot):
+            self.execute_command('MSET', *node_args)
 
         return True
 
@@ -719,10 +765,8 @@ class StrictRedisCluster(StrictRedis):
                 raise RedisError('MSETNX requires **kwargs or a single dict arg')
             kwargs.update(args[0])
 
-        # Itterate over all items and fail fast if one value is True.
-        for k, _ in kwargs.items():
-            if self.get(k):
-                return False
+        if any(self.mget(*kwargs.keys())):
+            return False
 
         return self.mset(**kwargs)
 
